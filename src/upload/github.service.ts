@@ -21,14 +21,28 @@ export interface ImageMetadata extends ImageRecord {
   telegramFileUniqueId: string;
 }
 
+interface Shard {
+  items: ImageRecord[];
+  sha?: string;
+}
+
+interface GitHubContentResponse {
+  content?: string;
+  sha?: string;
+  commit?: { sha?: string };
+}
+
+const SHARD_COUNT = 16;
+const MAX_WRITE_ATTEMPTS = 3;
+
 @Injectable()
 export class GithubService {
   private readonly logger = new Logger(GithubService.name);
+  private readonly apiUrl = 'https://api.github.com';
   private readonly token: string;
   private readonly owner: string;
   private readonly repo: string;
   private readonly branch: string;
-  private readonly metadataPath = 'data/records.json';
 
   constructor(private readonly configService: ConfigService) {
     this.token = this.configService.get<string>('GITHUB_TOKEN') || '';
@@ -50,171 +64,236 @@ export class GithubService {
     };
   }
 
-  /**
-   * Read all image records from metadata file on GitHub
-   */
   async readAllRecords(): Promise<ImageRecord[]> {
-    if (!this.isConfigured()) return [];
+    this.ensureConfigured();
+    const shards = await Promise.all(
+      Array.from({ length: SHARD_COUNT }, (_, index) => this.readShard(index)),
+    );
+    return shards.flatMap((shard) => shard.items);
+  }
 
-    const url = `https://api.github.com/repos/${this.owner}/${this.repo}/contents/${this.metadataPath}?ref=${this.branch}`;
+  async appendRecords(newRecords: ImageRecord[]): Promise<number> {
+    if (!newRecords.length) return 0;
+    this.ensureConfigured();
+
+    const byShard = new Map<number, ImageRecord[]>();
+    for (const record of newRecords) {
+      const shard = this.shardFor(record.id);
+      const records = byShard.get(shard) ?? [];
+      records.push(record);
+      byShard.set(shard, records);
+    }
+
+    let savedCount = 0;
+    for (const [shardIndex, records] of byShard) {
+      for (let attempt = 1; attempt <= MAX_WRITE_ATTEMPTS; attempt += 1) {
+        const current = await this.readShard(shardIndex);
+        const existingIds = new Set(current.items.map((record) => record.id));
+        const additions: ImageRecord[] = [];
+        for (const record of records) {
+          if (!existingIds.has(record.id)) {
+            additions.push(record);
+            existingIds.add(record.id);
+          }
+        }
+
+        if (!additions.length) break;
+
+        try {
+          const result = await this.writeShard(
+            shardIndex,
+            [...current.items, ...additions],
+            current.sha,
+            `chore(images): add ${additions.length} record(s) to shard ${this.shardName(shardIndex)}`,
+          );
+          savedCount += additions.length;
+          this.logSavedRecords(shardIndex, additions.length, result.commitSha);
+          break;
+        } catch (error) {
+          if (!this.isShaConflict(error) || attempt === MAX_WRITE_ATTEMPTS) {
+            throw error;
+          }
+        }
+      }
+    }
+
+    return savedCount;
+  }
+
+  async updateRecord(
+    id: string,
+    updates: Partial<ImageRecord>,
+  ): Promise<ImageRecord | null> {
+    this.ensureConfigured();
+    const shardIndex = this.shardFor(id);
+
+    for (let attempt = 1; attempt <= MAX_WRITE_ATTEMPTS; attempt += 1) {
+      const current = await this.readShard(shardIndex);
+      const index = current.items.findIndex((record) => record.id === id);
+      if (index === -1) return null;
+
+      const updatedRecord = { ...current.items[index], ...updates };
+      const nextItems = [...current.items];
+      nextItems[index] = updatedRecord;
+
+      try {
+        await this.writeShard(
+          shardIndex,
+          nextItems,
+          current.sha,
+          `chore(images): update record ${id}`,
+        );
+        return updatedRecord;
+      } catch (error) {
+        if (!this.isShaConflict(error) || attempt === MAX_WRITE_ATTEMPTS) {
+          throw error;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  async removeRecord(id: string): Promise<boolean> {
+    this.ensureConfigured();
+    const shardIndex = this.shardFor(id);
+
+    for (let attempt = 1; attempt <= MAX_WRITE_ATTEMPTS; attempt += 1) {
+      const current = await this.readShard(shardIndex);
+      const nextItems = current.items.filter((record) => record.id !== id);
+      if (nextItems.length === current.items.length) return false;
+
+      try {
+        await this.writeShard(
+          shardIndex,
+          nextItems,
+          current.sha,
+          `chore(images): remove record ${id}`,
+        );
+        return true;
+      } catch (error) {
+        if (!this.isShaConflict(error) || attempt === MAX_WRITE_ATTEMPTS) {
+          throw error;
+        }
+      }
+    }
+
+    return false;
+  }
+
+  private async readShard(index: number): Promise<Shard> {
+    const path = this.shardPath(index);
+    const url = `${this.apiUrl}/repos/${this.owner}/${this.repo}/contents/${path}?ref=${encodeURIComponent(this.branch)}`;
+
+    let response;
     try {
-      const res = await axios.get(url, {
+      response = await axios.get<GitHubContentResponse>(url, {
         headers: this.getHeaders(),
         timeout: 15000,
       });
-      const rawBase64 = res.data?.content || '';
-      const jsonStr = Buffer.from(rawBase64, 'base64').toString('utf8');
-      return JSON.parse(jsonStr) as ImageRecord[];
-    } catch (err: any) {
-      if (err.response?.status === 404) {
-        return [];
+    } catch (error) {
+      if (axios.isAxiosError(error) && error.response?.status === 404) {
+        return { items: [] };
       }
-      this.logger.warn(`Could not read records from GitHub: ${err.message}`);
-      return [];
+      throw error;
+    }
+
+    const content = response.data.content?.replace(/\s/g, '') ?? '';
+    if (!content) {
+      return { items: [], sha: response.data.sha };
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(Buffer.from(content, 'base64').toString('utf8'));
+    } catch (error) {
+      const reason = error instanceof Error ? `: ${error.message}` : '';
+      throw new Error(`Metadata ${path} is not valid JSON${reason}`);
+    }
+    if (!Array.isArray(parsed)) {
+      throw new Error(`Metadata ${path} must contain a JSON array.`);
+    }
+
+    return { items: parsed as ImageRecord[], sha: response.data.sha };
+  }
+
+  private async writeShard(
+    index: number,
+    items: ImageRecord[],
+    sha: string | undefined,
+    message: string,
+  ): Promise<{ commitSha?: string }> {
+    const path = this.shardPath(index);
+    const url = `${this.apiUrl}/repos/${this.owner}/${this.repo}/contents/${path}`;
+
+    try {
+      const response = await axios.put<GitHubContentResponse>(
+        url,
+        {
+          message,
+          content: Buffer.from(`${JSON.stringify(items, null, 2)}\n`).toString(
+            'base64',
+          ),
+          branch: this.branch,
+          ...(sha ? { sha } : {}),
+        },
+        { headers: this.getHeaders(), timeout: 30000 },
+      );
+      return { commitSha: response.data.commit?.sha };
+    } catch (error) {
+      if (axios.isAxiosError(error) && error.response) {
+        const status = error.response.status;
+        if (status === 409 || status === 422) {
+          const conflict = new Error(
+            `GitHub rejected a stale SHA while writing ${path} (${status}).`,
+          );
+          Object.assign(conflict, { status });
+          throw conflict;
+        }
+      }
+      throw error;
     }
   }
 
-  /**
-   * Append new image records to metadata file on GitHub
-   */
-  async appendRecords(newRecords: ImageRecord[]): Promise<void> {
-    if (!newRecords.length) return;
+  private shardFor(id: string): number {
+    const suffix = id.slice(-2);
+    if (!/^[0-9a-f]{2}$/i.test(suffix)) {
+      throw new Error(
+        `Image id "${id}" must end with two hexadecimal characters.`,
+      );
+    }
+    return Number.parseInt(suffix, 16) % SHARD_COUNT;
+  }
+
+  private shardName(index: number): string {
+    return index.toString(16).padStart(2, '0');
+  }
+
+  private shardPath(index: number): string {
+    return `metadata/images-${this.shardName(index)}.json`;
+  }
+
+  private isShaConflict(error: unknown): boolean {
+    return (
+      error instanceof Error &&
+      'status' in error &&
+      (error.status === 409 || error.status === 422)
+    );
+  }
+
+  private logSavedRecords(index: number, count: number, commitSha?: string) {
+    const commit = commitSha ? ` (commit ${commitSha})` : '';
+    this.logger.log(
+      `Saved ${count} records to GitHub metadata (${this.shardPath(index)} on ${this.branch})${commit}.`,
+    );
+  }
+
+  private ensureConfigured(): void {
     if (!this.isConfigured()) {
       throw new Error(
         'GitHub credentials missing. Please set GITHUB_TOKEN, GITHUB_OWNER, and GITHUB_REPO in .env.',
       );
     }
-
-    const url = `https://api.github.com/repos/${this.owner}/${this.repo}/contents/${this.metadataPath}`;
-
-    for (let attempt = 1; attempt <= 4; attempt++) {
-      try {
-        let existingRecords: ImageRecord[] = [];
-        let existingSha: string | undefined;
-        try {
-          const getRes = await axios.get(`${url}?ref=${this.branch}`, {
-            headers: this.getHeaders(),
-            timeout: 15000,
-          });
-          existingSha = getRes.data?.sha;
-          const rawBase64 = getRes.data?.content || '';
-          existingRecords = JSON.parse(
-            Buffer.from(rawBase64, 'base64').toString('utf8'),
-          ) as ImageRecord[];
-        } catch (err: any) {
-          if (err.response?.status !== 404) throw err;
-        }
-
-        const existingIds = new Set(existingRecords.map((record) => record.id));
-        const combined = [
-          ...existingRecords,
-          ...newRecords.filter((record) => !existingIds.has(record.id)),
-        ];
-        const updatedContent = Buffer.from(
-          JSON.stringify(combined, null, 2),
-          'utf8',
-        ).toString('base64');
-
-        await axios.put(
-          url,
-          {
-            message: `Update image records (${combined.length} items)`,
-            content: updatedContent,
-            sha: existingSha,
-            branch: this.branch,
-          },
-          { headers: this.getHeaders(), timeout: 30000 },
-        );
-        this.logger.log(
-          `Saved ${newRecords.length} records to GitHub metadata (${this.metadataPath}).`,
-        );
-        return;
-      } catch (putErr: any) {
-        if (attempt === 4) throw putErr;
-        const delay = Math.floor(1000 + Math.random() * 4000);
-        await new Promise((res) => setTimeout(res, delay));
-      }
-    }
-  }
-
-  /**
-   * Update an image record by ID
-   */
-  async updateRecord(
-    id: string,
-    updates: Partial<ImageRecord>,
-  ): Promise<ImageRecord | null> {
-    if (!this.isConfigured()) return null;
-    const url = `https://api.github.com/repos/${this.owner}/${this.repo}/contents/${this.metadataPath}`;
-
-    const getRes = await axios.get(`${url}?ref=${this.branch}`, {
-      headers: this.getHeaders(),
-      timeout: 15000,
-    });
-    const existingSha = getRes.data?.sha;
-    const rawBase64 = getRes.data?.content || '';
-    const records: ImageRecord[] = JSON.parse(
-      Buffer.from(rawBase64, 'base64').toString('utf8'),
-    );
-
-    const idx = records.findIndex((r) => r.id === id);
-    if (idx === -1) return null;
-
-    records[idx] = { ...records[idx], ...updates };
-    const updatedContent = Buffer.from(
-      JSON.stringify(records, null, 2),
-      'utf8',
-    ).toString('base64');
-
-    await axios.put(
-      url,
-      {
-        message: `Update image record ${id}`,
-        content: updatedContent,
-        sha: existingSha,
-        branch: this.branch,
-      },
-      { headers: this.getHeaders(), timeout: 30000 },
-    );
-
-    return records[idx];
-  }
-
-  /** Remove an image record by ID. */
-  async removeRecord(id: string): Promise<boolean> {
-    if (!this.isConfigured()) return false;
-    const url = `https://api.github.com/repos/${this.owner}/${this.repo}/contents/${this.metadataPath}`;
-
-    const getRes = await axios.get(`${url}?ref=${this.branch}`, {
-      headers: this.getHeaders(),
-      timeout: 15000,
-    });
-    const existingSha = getRes.data?.sha;
-    const rawBase64 = getRes.data?.content || '';
-    const records: ImageRecord[] = JSON.parse(
-      Buffer.from(rawBase64, 'base64').toString('utf8'),
-    );
-
-    const filtered = records.filter((r) => r.id !== id);
-    if (filtered.length === records.length) return false;
-
-    const updatedContent = Buffer.from(
-      JSON.stringify(filtered, null, 2),
-      'utf8',
-    ).toString('base64');
-
-    await axios.put(
-      url,
-      {
-        message: `Remove image record ${id}`,
-        content: updatedContent,
-        sha: existingSha,
-        branch: this.branch,
-      },
-      { headers: this.getHeaders(), timeout: 30000 },
-    );
-
-    return true;
   }
 
   private getHeaders() {

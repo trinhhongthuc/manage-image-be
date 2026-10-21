@@ -23,7 +23,7 @@ describe('UploadService', () => {
         {
           provide: GithubService,
           useValue: {
-            appendRecords: jest.fn().mockResolvedValue(undefined),
+            appendRecords: jest.fn().mockResolvedValue(1),
             getConfigSummary: jest.fn().mockReturnValue({ configured: true }),
           },
         },
@@ -37,7 +37,7 @@ describe('UploadService', () => {
 
   it('commits only the provided metadata items to GitHub', async () => {
     const item = {
-      id: 'img_example',
+      id: 'img_00000000000000000000000000000001',
       filename: 'photo.jpg',
       telegramFileId: 'telegram-file-id',
       telegramFileUniqueId: 'telegram-file-unique-id',
@@ -78,5 +78,26 @@ describe('UploadService', () => {
 
     expect(githubService.appendRecords).not.toHaveBeenCalled();
     expect(telegramService.deleteMessage).not.toHaveBeenCalled();
+  });
+
+  it('rejects IDs that cannot be assigned to a metadata shard', async () => {
+    await expect(
+      service.commitMetadata({
+        items: [
+          {
+            id: 'img_example',
+            filename: 'photo.jpg',
+            telegramFileId: 'telegram-file-id',
+            telegramFileUniqueId: 'telegram-file-unique-id',
+            telegramMessageId: 123,
+            size: 1024,
+            mimeType: 'image/jpeg',
+            createdAt: '2026-10-21T08:00:00.000Z',
+          },
+        ],
+      }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+
+    expect(githubService.appendRecords).not.toHaveBeenCalled();
   });
 });

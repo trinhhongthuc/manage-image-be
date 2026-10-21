@@ -1,6 +1,6 @@
 # Manage Image Backend
 
-Backend nhận metadata ảnh từ FE và commit vào `data/records.json` trong GitHub repository. FE chịu trách nhiệm upload ảnh lên Telegram và gửi các Telegram IDs cùng metadata tới backend. Backend không nhận, lưu hoặc xử lý file ảnh.
+Backend nhận metadata ảnh từ FE và commit vào một trong 16 file shard `metadata/images-00.json` đến `metadata/images-0f.json` trong GitHub repository. Shard được chọn từ hai ký tự hexadecimal cuối của `id`, giống logic lưu trữ của frontend. FE chịu trách nhiệm upload ảnh lên Telegram và gửi các Telegram IDs cùng metadata tới backend. Backend không nhận, lưu hoặc xử lý file ảnh.
 
 ## Cấu hình
 
@@ -41,7 +41,7 @@ Các endpoint sau nhận cùng payload JSON và commit metadata lên GitHub:
 {
   "items": [
     {
-      "id": "img_example",
+      "id": "img_00000000000000000000000000000001",
       "filename": "photo.jpg",
       "telegramFileId": "telegram-file-id",
       "telegramFileUniqueId": "telegram-file-unique-id",
@@ -55,14 +55,14 @@ Các endpoint sau nhận cùng payload JSON và commit metadata lên GitHub:
 }
 ```
 
-Backend kiểm tra các trường metadata bắt buộc rồi append items vào `data/records.json`, sau đó commit file JSON lên nhánh cấu hình trong `.env`. Không cần gửi `multipart/form-data`; file ảnh hoặc video không được đọc hay ghi xuống server.
+Backend kiểm tra các trường metadata bắt buộc, đọc shard và SHA hiện tại từ GitHub, rồi append các record mới vào shard tương ứng. Nếu SHA xung đột, backend đọc lại shard mới nhất và thử ghi lại tối đa ba lần. GitHub token chỉ được đọc từ biến môi trường phía server; không gửi token xuống frontend. Không cần gửi `multipart/form-data`; file ảnh hoặc video không được đọc hay ghi xuống server.
 
 Ví dụ:
 
 ```bash
 curl -X POST http://localhost:3000/api/images \
   -H "Content-Type: application/json" \
-  -d "{\"items\":[{\"id\":\"img_example\",\"filename\":\"photo.jpg\",\"telegramFileId\":\"telegram-file-id\",\"telegramFileUniqueId\":\"telegram-file-unique-id\",\"telegramMessageId\":123,\"size\":1024,\"mimeType\":\"image/jpeg\",\"createdAt\":\"2026-10-21T08:00:00.000Z\",\"album\":\"optional-folder\"}]}"
+  -d "{\"items\":[{\"id\":\"img_00000000000000000000000000000001\",\"filename\":\"photo.jpg\",\"telegramFileId\":\"telegram-file-id\",\"telegramFileUniqueId\":\"telegram-file-unique-id\",\"telegramMessageId\":123,\"size\":1024,\"mimeType\":\"image/jpeg\",\"createdAt\":\"2026-10-21T08:00:00.000Z\",\"album\":\"optional-folder\"}]}"
 ```
 
 Phản hồi:

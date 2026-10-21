@@ -33,8 +33,8 @@ export class UploadService {
     const items = payload.items.map((item, index) =>
       this.validateMetadataItem(item, index),
     );
-    await this.githubService.appendRecords(items);
-    return { success: true, committed: items.length };
+    const committed = await this.githubService.appendRecords(items);
+    return { success: true, committed };
   }
 
   private validateMetadataItem(item: unknown, index: number): ImageMetadata {
@@ -50,6 +50,7 @@ export class UploadService {
     if (
       typeof value.id !== 'string' ||
       !value.id.trim() ||
+      !/[0-9a-f]{2}$/i.test(value.id) ||
       typeof value.filename !== 'string' ||
       !value.filename.trim() ||
       typeof value.telegramFileId !== 'string' ||
