@@ -5,12 +5,11 @@ import { ImagesController } from './images.controller';
 import { UploadService } from './upload.service';
 import { TelegramService } from './telegram.service';
 import { GithubService } from './github.service';
-import { StagingQueueService } from './staging-queue.service';
 
 @Module({
   imports: [ConfigModule],
   controllers: [UploadController, ImagesController],
-  providers: [UploadService, TelegramService, GithubService, StagingQueueService],
-  exports: [UploadService, TelegramService, GithubService, StagingQueueService],
+  providers: [UploadService, TelegramService, GithubService],
+  exports: [UploadService, TelegramService, GithubService],
 })
 export class UploadModule {}

@@ -1,21 +1,8 @@
+import { BadRequestException } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
-import { UploadService } from './upload.service';
-import { TelegramService } from './telegram.service';
 import { GithubService } from './github.service';
-import { StagingQueueService } from './staging-queue.service';
-import * as fs from 'fs';
-
-jest.mock('fs', () => {
-  const original = jest.requireActual('fs');
-  return {
-    ...original,
-    existsSync: jest.fn(),
-    promises: {
-      ...original.promises,
-      unlink: jest.fn(),
-    },
-  };
-});
+import { TelegramService } from './telegram.service';
+import { UploadService } from './upload.service';
 
 describe('UploadService', () => {
   let service: UploadService;
@@ -29,41 +16,15 @@ describe('UploadService', () => {
         {
           provide: TelegramService,
           useValue: {
-            sendImagesInAlbums: jest.fn().mockResolvedValue([
-              {
-                filename: 'stored_test1.jpg',
-                originalName: 'test1.jpg',
-                success: true,
-                messageId: 100,
-                fileId: 'tele_123',
-              },
-            ]),
+            deleteMessage: jest.fn(),
             isConfigured: jest.fn().mockReturnValue(true),
           },
         },
         {
           provide: GithubService,
           useValue: {
-            uploadFiles: jest.fn().mockResolvedValue([
-              {
-                filename: 'stored_test1.jpg',
-                originalName: 'test1.jpg',
-                path: 'uploads/stored_test1.jpg',
-                success: true,
-                htmlUrl: 'https://github.com/test',
-                rawUrl: 'https://raw.githubusercontent.com/test',
-              },
-            ]),
             appendRecords: jest.fn().mockResolvedValue(undefined),
-            isConfigured: jest.fn().mockReturnValue(true),
-            getConfigSummary: jest.fn().mockReturnValue({}),
-          },
-        },
-        {
-          provide: StagingQueueService,
-          useValue: {
-            enqueueBatch: jest.fn(),
-            getSessionStatus: jest.fn(),
+            getConfigSummary: jest.fn().mockReturnValue({ configured: true }),
           },
         },
       ],
@@ -74,28 +35,48 @@ describe('UploadService', () => {
     githubService = module.get<GithubService>(GithubService);
   });
 
-  it('should process images, upload to Telegram & GitHub, and delete local files', async () => {
-    (fs.existsSync as jest.Mock).mockReturnValue(true);
-    (fs.promises.unlink as jest.Mock).mockResolvedValue(undefined);
+  it('commits only the provided metadata items to GitHub', async () => {
+    const item = {
+      id: 'img_example',
+      filename: 'photo.jpg',
+      telegramFileId: 'telegram-file-id',
+      telegramFileUniqueId: 'telegram-file-unique-id',
+      telegramMessageId: 123,
+      size: 1024,
+      mimeType: 'image/jpeg',
+      createdAt: '2026-10-21T08:00:00.000Z',
+      album: 'optional-folder',
+      ignoredExtraField: 'not committed',
+    };
 
-    const mockFiles = [
-      {
-        fieldname: 'files',
-        originalname: 'test1.jpg',
-        filename: 'stored_test1.jpg',
-        path: './uploads/stored_test1.jpg',
-        mimetype: 'image/jpeg',
-        size: 1024,
-      } as Express.Multer.File,
-    ];
+    const result = await service.commitMetadata({ items: [item] });
 
-    const result = await service.processImages(mockFiles, { caption: 'Test' });
+    expect(result).toEqual({
+      success: true,
+      committed: 1,
+    });
+    expect(githubService.appendRecords).toHaveBeenCalledWith([
+      expect.objectContaining({
+        id: item.id,
+        filename: item.filename,
+        telegramFileId: item.telegramFileId,
+        telegramFileUniqueId: item.telegramFileUniqueId,
+        telegramMessageId: item.telegramMessageId,
+        size: item.size,
+        mimeType: item.mimeType,
+        createdAt: item.createdAt,
+        album: item.album,
+      }),
+    ]);
+    expect(telegramService.deleteMessage).not.toHaveBeenCalled();
+  });
 
-    expect(result.items.length).toBe(1);
-    expect(result.items[0].filename).toBe('test1.jpg');
-    expect(result.errors.length).toBe(0);
-    expect(fs.promises.unlink).toHaveBeenCalledWith('./uploads/stored_test1.jpg');
-    expect(telegramService.sendImagesInAlbums).toHaveBeenCalledWith(mockFiles, 'Test', false);
-    expect(githubService.uploadFiles).toHaveBeenCalledWith(mockFiles, undefined);
+  it('rejects malformed metadata without calling GitHub', async () => {
+    await expect(
+      service.commitMetadata({ items: [{ id: 'missing-required-fields' }] }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+
+    expect(githubService.appendRecords).not.toHaveBeenCalled();
+    expect(telegramService.deleteMessage).not.toHaveBeenCalled();
   });
 });

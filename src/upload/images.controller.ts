@@ -6,19 +6,11 @@ import {
   Delete,
   Query,
   Body,
-  UploadedFiles,
-  UseInterceptors,
-  Req,
-  Param,
   HttpCode,
   HttpException,
   HttpStatus,
 } from '@nestjs/common';
-import { AnyFilesInterceptor } from '@nestjs/platform-express';
 import { UploadService } from './upload.service';
-import { multerOptions } from './multer.config';
-import type { Request } from 'express';
-import { randomUUID } from 'crypto';
 
 @Controller('api/images')
 export class ImagesController {
@@ -82,114 +74,17 @@ export class ImagesController {
     };
   }
 
-  /**
-   * POST /api/images - Hỗ trợ cả 2 dạng:
-   * 1. multipart/form-data: form chứa files, album, fast (tải lượng lớn ảnh)
-   *    - Multipart: luôn lưu staging và trả về ngay (Client có thể đóng tab).
-   * 2. application/json: { url, filename, album } (tải từ URL)
-   */
+  /** POST /api/images - Commit metadata JSON to GitHub. */
   @Post()
-  @HttpCode(HttpStatus.ACCEPTED)
-  @UseInterceptors(AnyFilesInterceptor(multerOptions))
-  async upload(
-    @UploadedFiles() files: Express.Multer.File[],
-    @Body('album') album?: string,
-    @Body('caption') caption?: string,
-    @Body('fast') fast?: string,
-    @Body('sessionId') bodySessionId?: string,
-    @Query('sessionId') querySessionId?: string,
-    @Req() req?: Request,
-  ) {
-    if (req?.headers['content-type']?.includes('application/json')) {
-      return this.uploadService.processUrlUpload(req.body);
-    }
-
-    const sessionId =
-      querySessionId ||
-      bodySessionId ||
-      (req?.headers['x-session-id'] as string) ||
-      `sess_${randomUUID()}`;
-    const manifest = await this.uploadService.enqueueStagingBatch(
-      sessionId,
-      files,
-      {
-        album,
-        caption,
-        isFast: fast === 'true',
-      },
-    );
-
-    return {
-      success: true,
-      async: true,
-      sessionId,
-      batchReceived: files.length,
-      totalQueued: manifest.totalFiles,
-      status: manifest.status,
-      message: `Đã lưu ${files.length} ảnh trên server. Đang tải ngầm lên Telegram và GitHub; bạn có thể đóng tab.`,
-    };
+  @HttpCode(HttpStatus.OK)
+  async upload(@Body() payload: unknown) {
+    return this.uploadService.commitMetadata(payload);
   }
 
-  /**
-   * Alias: POST /api/images/batch - Dành riêng cho client tải theo lô bất đồng bộ
-   */
   @Post('batch')
-  @HttpCode(HttpStatus.ACCEPTED)
-  @UseInterceptors(AnyFilesInterceptor(multerOptions))
-  async uploadBatch(
-    @UploadedFiles() files: Express.Multer.File[],
-    @Body('album') album?: string,
-    @Body('caption') caption?: string,
-    @Body('fast') fast?: string,
-    @Body('sessionId') bodySessionId?: string,
-    @Query('sessionId') querySessionId?: string,
-    @Req() req?: Request,
-  ) {
-    const sessionId =
-      querySessionId ||
-      bodySessionId ||
-      (req?.headers['x-session-id'] as string) ||
-      `sess_${randomUUID()}`;
-
-    const manifest = await this.uploadService.enqueueStagingBatch(
-      sessionId,
-      files,
-      {
-        album,
-        caption,
-        isFast: fast === 'true',
-      },
-    );
-
-    return {
-      success: true,
-      async: true,
-      sessionId,
-      batchReceived: files.length,
-      totalQueued: manifest.totalFiles,
-      status: manifest.status,
-      message: `Đã lưu an toàn ${files.length} ảnh vào server. Đang tiến hành tải ngầm lên Telegram & GitHub.`,
-    };
-  }
-
-  /**
-   * GET /api/images/session/:sessionId - Kiểm tra tiến độ xử lý ngầm của session
-   */
-  @Get('session/:sessionId')
-  async getSessionStatus(@Param('sessionId') sessionId: string) {
-    if (!sessionId) {
-      throw new HttpException('Thiếu sessionId.', HttpStatus.BAD_REQUEST);
-    }
-
-    const status = await this.uploadService.getSessionStatus(sessionId);
-    if (!status) {
-      throw new HttpException(
-        'Không tìm thấy phiên upload.',
-        HttpStatus.NOT_FOUND,
-      );
-    }
-
-    return status;
+  @HttpCode(HttpStatus.OK)
+  async uploadBatch(@Body() payload: unknown) {
+    return this.uploadService.commitMetadata(payload);
   }
 
   /**
